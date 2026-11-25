@@ -1,5 +1,7 @@
+
 import os
 import random
+import time
 from datetime import datetime
 from typing import Any
 from dotenv import load_dotenv
@@ -227,7 +229,6 @@ async def list_tickets():
 @app.post("/api/chat")
 async def chat_endpoint(req: ChatRequest):
     global _current_request_tools
-    _current_request_tools = []
 
     if not GEMINI_API_KEY:
         return JSONResponse(
@@ -236,35 +237,56 @@ async def chat_endpoint(req: ChatRequest):
         )
 
     history = CHAT_SESSIONS.setdefault(req.session_id, [])
-    history.append(types.Content(role="user", parts=[types.Part.from_text(text=req.message)]))
+    user_turn = types.Content(role="user", parts=[types.Part.from_text(text=req.message)])
+    conversation = history[-10:] + [user_turn]
 
-    # Keep last 12 messages to stay lightweight on free tier
-    if len(history) > 12:
-        history = history[-12:]
-        CHAT_SESSIONS[req.session_id] = history
+    last_error = ""
+    for attempt in range(4):
+        _current_request_tools = []
+        try:
+            response = client.models.generate_content(
+                model=MODEL_ID,
+                contents=conversation,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTION,
+                    tools=[check_order_status, initiate_return_or_exchange, create_support_ticket],
+                    temperature=0.2,
+                ),
+            )
+            reply_text = response.text or "I'm sorry, I couldn't process that request. Please try again."
 
-    try:
-        response = client.models.generate_content(
-            model=MODEL_ID,
-            contents=history,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                tools=[check_order_status, initiate_return_or_exchange, create_support_ticket],
-                temperature=0.2,
-            ),
-        )
-        reply_text = response.text or "I'm sorry, I couldn't process that request. Please try again."
-        history.append(types.Content(role="model", parts=[types.Part.from_text(text=reply_text)]))
-        return {
-            "reply": reply_text,
-            "tools": list(_current_request_tools),
-            "ticket_count": len(TICKETS_DB),
-        }
-    except Exception as e:
+            # Save turns only after a successful response so failed retries never corrupt history
+            history.append(user_turn)
+            history.append(types.Content(role="model", parts=[types.Part.from_text(text=reply_text)]))
+            if len(history) > 12:
+                CHAT_SESSIONS[req.session_id] = history[-12:]
+
+            return {
+                "reply": reply_text,
+                "tools": list(_current_request_tools),
+                "ticket_count": len(TICKETS_DB),
+            }
+        except Exception as e:
+            last_error = str(e)
+            is_transient = any(code in last_error for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"))
+            if is_transient and attempt < 3:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            break
+
+    if any(code in last_error for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")):
         return JSONResponse(
-            status_code=500,
-            content={"reply": f"Assistant error: {str(e)}", "tools": []},
+            status_code=503,
+            content={
+                "reply": "Gemini is experiencing a brief traffic spike right now. Please tap Send again in 3 seconds.",
+                "tools": [],
+            },
         )
+
+    return JSONResponse(
+        status_code=500,
+        content={"reply": f"Assistant error: {last_error}", "tools": []},
+    )
 
 
 @app.get("/widget.js")
