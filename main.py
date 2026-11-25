@@ -1,6 +1,6 @@
-
 import os
 import random
+import re
 import time
 from datetime import datetime
 from typing import Any
@@ -16,7 +16,8 @@ load_dotenv()
 app = FastAPI(title="VastraVibe AI Customer Support Agent")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MODEL_ID = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+FALLBACK_MODELS = list(dict.fromkeys([PRIMARY_MODEL, "gemini-3.8-flash-lite"]))
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -79,6 +80,7 @@ ORDERS_DB: dict[str, dict[str, Any]] = {
 TICKETS_DB: list[dict[str, Any]] = []
 RETURN_REQUESTS_DB: list[dict[str, Any]] = []
 CHAT_SESSIONS: dict[str, list[types.Content]] = {}
+PENDING_ESCALATION: set[str] = set()
 
 # Track tools called during the active request
 _current_request_tools: list[str] = []
@@ -185,6 +187,84 @@ def create_support_ticket(
     return {"created": True, **ticket}
 
 
+def backup_support_engine(session_id: str, user_msg: str) -> str:
+    """Zero-downtime backup engine when Gemini cloud servers experience 503 high-demand spikes."""
+    text = user_msg.strip()
+    lower = text.lower()
+
+    # 1. Human escalation flow
+    phone_match = re.search(r"\b([6-9]\d{9})\b", re.sub(r"[\s\-]", "", text))
+    if session_id in PENDING_ESCALATION or any(k in lower for k in ("human", "agent", "escalate", "manager", "call me")):
+        if phone_match:
+            phone = phone_match.group(1)
+            cleaned_name = re.sub(r"[\d\+\-\(\),]", " ", text)
+            cleaned_name = re.sub(r"\b(my name is|name|phone|number|mobile|call|please|hi|hello)\b", "", cleaned_name, flags=re.I).strip()
+            customer_name = cleaned_name.title() if len(cleaned_name) >= 2 else "Valued Customer"
+            PENDING_ESCALATION.discard(session_id)
+            tkt = create_support_ticket(
+                customer_name=customer_name,
+                phone=phone,
+                issue_summary="Customer requested human specialist callback via web support chat.",
+                priority="High",
+            )
+            return (
+                f"I've created a priority support ticket for you:\n"
+                f"• Ticket ID: {tkt['ticket_id']}\n"
+                f"• Name: {tkt['customer_name']}\n"
+                f"• Mobile: {tkt['phone']}\n"
+                f"• Callback SLA: {tkt['sla']}"
+            )
+        PENDING_ESCALATION.add(session_id)
+        return "I'd be happy to connect you with a human support specialist. Please reply with your Full Name and 10-digit Mobile Number (e.g., Aarav Mehta, 9876543210)."
+
+    # 2. Order lookup or return/exchange flow
+    ord_match = re.search(r"\b(?:ORD-)?(10\d{2}|\d{4})\b", text, flags=re.I)
+    if ord_match:
+        order_id = f"ORD-{ord_match.group(1)}"
+        if any(k in lower for k in ("return", "exchange", "replace", "size", "tight", "loose", "damaged", "defective")):
+            action = "Return" if "return" in lower or "refund" in lower else "Exchange"
+            res = initiate_return_or_exchange(order_id=order_id, action=action, reason=text)
+            if not res.get("success"):
+                return res["message"]
+            return (
+                f"Your {res['action'].lower()} request has been scheduled:\n"
+                f"• Request ID: {res['request_id']}\n"
+                f"• Order ID: {res['order_id']}\n"
+                f"• Reverse Pickup: {res['pickup_eta']}\n"
+                f"• Note: {res['refund_note']}"
+            )
+
+        order = check_order_status(order_id)
+        if not order.get("found"):
+            return order["message"]
+        return (
+            f"Here are the live details for {order['order_id']}:\n"
+            f"• Item: {order['items']}\n"
+            f"• Status: {order['status']}\n"
+            f"• Courier & AWB: {order['courier']} ({order['awb']})\n"
+            f"• Payment: ₹{order['amount_inr']} ({order['payment_mode']})\n"
+            f"• Delivery / ETA: {order['eta']}"
+        )
+
+    # 3. Store Policy FAQs
+    if any(k in lower for k in ("cod", "cash", "refund", "return", "exchange", "ship", "delivery", "policy")):
+        return (
+            "Here are VastraVibe India's store policies:\n"
+            "• Shipping: Free on all Prepaid orders (2–4 business days in Metros, 4–6 days Rest of India).\n"
+            "• Cash on Delivery (COD): Available up to ₹4,999 with a ₹49 COD handling fee.\n"
+            "• Returns & Exchanges: 7-day hassle-free reverse pickup for unused items with tags intact; 1 size exchange is free.\n"
+            "• Refunds: Prepaid refunds credit in 3–5 business days after pickup QC; COD refunds credit via instant UPI link within 48 hours."
+        )
+
+    return (
+        "I can help you right away with:\n"
+        "• Order Tracking (share your Order ID like ORD-1042 or ORD-1044)\n"
+        "• 7-Day Returns & Size Exchanges (e.g., Exchange ORD-1043)\n"
+        "• COD, Shipping & Refund Policies\n"
+        "• Human Agent Callback (type Escalate to human)"
+    )
+
+
 SYSTEM_INSTRUCTION = """
 You are the AI Customer Support Specialist for **VastraVibe India**, an Indian D2C fashion and everyday essentials brand.
 
@@ -218,7 +298,7 @@ class ChatRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "running", "model": MODEL_ID, "tickets_count": len(TICKETS_DB)}
+    return {"status": "running", "models": FALLBACK_MODELS, "tickets_count": len(TICKETS_DB)}
 
 
 @app.get("/api/tickets")
@@ -241,47 +321,48 @@ async def chat_endpoint(req: ChatRequest):
     conversation = history[-10:] + [user_turn]
 
     last_error = ""
-    for attempt in range(4):
+    for model_name in FALLBACK_MODELS:
+        for attempt in range(2):
+            _current_request_tools = []
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=conversation,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_INSTRUCTION,
+                        tools=[check_order_status, initiate_return_or_exchange, create_support_ticket],
+                        temperature=0.2,
+                    ),
+                )
+                reply_text = response.text or "I'm sorry, I couldn't process that request. Please try again."
+                history.append(user_turn)
+                history.append(types.Content(role="model", parts=[types.Part.from_text(text=reply_text)]))
+                if len(history) > 12:
+                    CHAT_SESSIONS[req.session_id] = history[-12:]
+                return {
+                    "reply": reply_text,
+                    "tools": list(_current_request_tools),
+                    "ticket_count": len(TICKETS_DB),
+                }
+            except Exception as e:
+                last_error = str(e)
+                is_transient = any(code in last_error for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"))
+                if is_transient and attempt == 0:
+                    time.sleep(1.5)
+                    continue
+                break
+
+    # Seamless zero-downtime fallback if Gemini cloud models are experiencing 503 high demand
+    if any(code in last_error for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "404", "NOT_FOUND")):
         _current_request_tools = []
-        try:
-            response = client.models.generate_content(
-                model=MODEL_ID,
-                contents=conversation,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_INSTRUCTION,
-                    tools=[check_order_status, initiate_return_or_exchange, create_support_ticket],
-                    temperature=0.2,
-                ),
-            )
-            reply_text = response.text or "I'm sorry, I couldn't process that request. Please try again."
-
-            # Save turns only after a successful response so failed retries never corrupt history
-            history.append(user_turn)
-            history.append(types.Content(role="model", parts=[types.Part.from_text(text=reply_text)]))
-            if len(history) > 12:
-                CHAT_SESSIONS[req.session_id] = history[-12:]
-
-            return {
-                "reply": reply_text,
-                "tools": list(_current_request_tools),
-                "ticket_count": len(TICKETS_DB),
-            }
-        except Exception as e:
-            last_error = str(e)
-            is_transient = any(code in last_error for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"))
-            if is_transient and attempt < 3:
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            break
-
-    if any(code in last_error for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")):
-        return JSONResponse(
-            status_code=503,
-            content={
-                "reply": "Gemini is experiencing a brief traffic spike right now. Please tap Send again in 3 seconds.",
-                "tools": [],
-            },
-        )
+        fallback_reply = backup_support_engine(req.session_id, req.message)
+        history.append(user_turn)
+        history.append(types.Content(role="model", parts=[types.Part.from_text(text=fallback_reply)]))
+        return {
+            "reply": fallback_reply,
+            "tools": list(_current_request_tools),
+            "ticket_count": len(TICKETS_DB),
+        }
 
     return JSONResponse(
         status_code=500,
